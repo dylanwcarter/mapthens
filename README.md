@@ -1,4 +1,4 @@
-[mapthens](https://mapthens.com)
+# [mapthens](https://mapthens.com)
 
 **mapthens** is an interactive event map for Athens, GA, helping users discover upcoming local events in real time.
 
