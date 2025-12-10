@@ -1,8 +1,6 @@
 package main
 
 import (
-	"bytes"
-	"context"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -10,14 +8,13 @@ import (
 	"net/url"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/PuerkitoBio/goquery"
-	"github.com/aws/aws-lambda-go/lambda"
-	"github.com/aws/aws-sdk-go-v2/aws"
-	"github.com/aws/aws-sdk-go-v2/config"
-	"github.com/aws/aws-sdk-go-v2/service/s3"
 )
+
+// Data Structures
 
 type Event struct {
 	Date        string  `json:"date"`
@@ -32,20 +29,34 @@ type Event struct {
 	Longitude   float64 `json:"longitude"`
 }
 
-type Geometry struct {
-	Coordinates [2]float64 `json:"coordinates"`
+type MapboxResponse struct {
+	Features []struct {
+		Geometry struct {
+			Coordinates [2]float64 `json:"coordinates"`
+		} `json:"geometry"`
+	} `json:"features"`
 }
 
-type Feature struct {
-	Geometry Geometry `json:"geometry"`
+type APIResponse struct {
+	Events      []Event `json:"events"`
+	MapboxToken string  `json:"mapbox_token"`
 }
 
-type Response struct {
-	Features []Feature `json:"features"`
-}
+// Global Variables
+var (
+	eventsCache []Event
+	cacheTime   time.Time
+	mutex       sync.RWMutex
+	dataFile    = "events.json"
+)
+
+// Helper Functions
 
 func geocodeAddress(address string) (float64, float64, error) {
 	accessToken := os.Getenv("MAPBOX_ACCESS_TOKEN")
+	if accessToken == "" {
+		return 0, 0, fmt.Errorf("MAPBOX_ACCESS_TOKEN not set")
+	}
 
 	baseURL := "https://api.mapbox.com/search/geocode/v6/forward"
 	params := url.Values{}
@@ -64,7 +75,7 @@ func geocodeAddress(address string) (float64, float64, error) {
 		return 0, 0, fmt.Errorf("non-200 status code: %d", resp.StatusCode)
 	}
 
-	var result Response
+	var result MapboxResponse
 	decoder := json.NewDecoder(resp.Body)
 	if err := decoder.Decode(&result); err != nil {
 		return 0, 0, fmt.Errorf("error decoding json response: %v", err)
@@ -81,6 +92,7 @@ func geocodeAddress(address string) (float64, float64, error) {
 }
 
 func scrapeEvents() ([]Event, error) {
+	log.Println("Scraping events from flagpole.com...")
 	resp, err := http.Get("https://flagpole.com/events/")
 	if err != nil {
 		return nil, fmt.Errorf("failed to fetch events page: %v", err)
@@ -115,9 +127,13 @@ func scrapeEvents() ([]Event, error) {
 
 		longitude, latitude, err := geocodeAddress(address)
 		if err != nil {
-			log.Printf("Error decoding address for event, %v", err)
-			latitude = -1
-			longitude = -1
+			log.Printf("Error geocoding address '%s': %v", address, err)
+			// Keep going even if geocoding fails, maybe set to 0,0 or omit
+			latitude = 0
+			longitude = 0
+		} else {
+			// Small delay to be nice to the API if processing many
+			time.Sleep(100 * time.Millisecond)
 		}
 
 		eventList = append(eventList, Event{
@@ -133,60 +149,103 @@ func scrapeEvents() ([]Event, error) {
 			Longitude:   longitude,
 		})
 	})
-
+	
+	log.Printf("Scraped %d events.", len(eventList))
 	return eventList, nil
 }
 
-func uploadToS3(ctx context.Context, data []byte) error {
-	bucketName := os.Getenv("S3_BUCKET")
-	objectKey := time.Now().Format("2006-01-02") + "_" + os.Getenv("S3_OBJECT_KEY")
-
-	if bucketName == "" || objectKey == "" {
-		return fmt.Errorf("missing S3_BUCKET or S3_OBJECT_KEY environment variables")
-	}
-
-	cfg, err := config.LoadDefaultConfig(ctx, config.WithRegion("us-east-1"))
+func saveEventsToFile(events []Event) error {
+	data, err := json.MarshalIndent(events, "", "  ")
 	if err != nil {
-		return fmt.Errorf("unable to load AWS SDK config: %v", err)
+		return err
 	}
-
-	s3Client := s3.NewFromConfig(cfg)
-
-	_, err = s3Client.PutObject(ctx, &s3.PutObjectInput{
-		Bucket: aws.String(bucketName),
-		Key:    aws.String(objectKey),
-		Body:   bytes.NewReader(data),
-	})
-	if err != nil {
-		return fmt.Errorf("failed to upload JSON to S3: %v", err)
-	}
-
-	return nil
+	return os.WriteFile(dataFile, data, 0644)
 }
 
-func handler(ctx context.Context) error {
-	events, err := scrapeEvents()
+func loadEventsFromFile() ([]Event, error) {
+	data, err := os.ReadFile(dataFile)
 	if err != nil {
-		log.Printf("Error scraping events: %v", err)
-		return err
+		return nil, err
+	}
+	var events []Event
+	if err := json.Unmarshal(data, &events); err != nil {
+		return nil, err
+	}
+	return events, nil
+}
+
+func getEvents() ([]Event, error) {
+	mutex.Lock()
+	defer mutex.Unlock()
+
+	// Check if we need to scrape (e.g., file doesn't exist or is old)
+	// For simplicity, let's just check if it exists and scrape if not.
+	// You might want to add logic to re-scrape daily.
+	
+	// If in-memory cache is empty, try loading from file
+	if len(eventsCache) == 0 {
+		if _, err := os.Stat(dataFile); err == nil {
+			// File exists, load it
+			events, err := loadEventsFromFile()
+			if err == nil {
+				eventsCache = events
+				log.Println("Loaded events from local file.")
+			}
+		}
 	}
 
-	jsonData, err := json.MarshalIndent(events, "", "  ")
-	if err != nil {
-		log.Printf("Error marshalling JSON: %v", err)
-		return err
+	// If still empty (file didn't exist or error), scrape
+	if len(eventsCache) == 0 {
+		events, err := scrapeEvents()
+		if err != nil {
+			return nil, err
+		}
+		eventsCache = events
+		if err := saveEventsToFile(events); err != nil {
+			log.Printf("Warning: Failed to save events to file: %v", err)
+		}
 	}
 
-	err = uploadToS3(ctx, jsonData)
-	if err != nil {
-		log.Printf("Error uploading to S3: %v", err)
-		return err
+	return eventsCache, nil
+}
+
+// HTTP Handlers
+
+func apiHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
 	}
 
-	fmt.Println("Successfully uploaded to s3")
-	return nil
+	events, err := getEvents()
+	if err != nil {
+		http.Error(w, fmt.Sprintf("Error fetching events: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	response := APIResponse{
+		Events:      events,
+		MapboxToken: os.Getenv("MAPBOX_ACCESS_TOKEN"),
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Access-Control-Allow-Origin", "*") // Allow CORS if running separately, harmless otherwise
+	json.NewEncoder(w).Encode(response)
 }
 
 func main() {
-	lambda.Start(handler)
+	port := os.Getenv("PORT")
+	if port == "" {
+		port = "8080"
+	}
+
+	// Serve static files
+	fs := http.FileServer(http.Dir("../public"))
+	http.Handle("/", fs)
+
+	// API endpoint
+	http.HandleFunc("/api/events", apiHandler)
+
+	fmt.Printf("Server starting on http://localhost:%s\n", port)
+	log.Fatal(http.ListenAndServe(":"+port, nil))
 }

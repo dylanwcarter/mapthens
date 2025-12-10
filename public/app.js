@@ -1,6 +1,6 @@
 async function fetchEventsAndToken() {
     try {
-      const response = await fetch('https://bvf65uhcw3fp2blgaz66cfi37i0paetl.lambda-url.us-east-1.on.aws/');
+      const response = await fetch('/api/events');
       if (!response.ok) throw new Error('Failed to fetch data');
   
       const data = await response.json();
